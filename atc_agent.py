@@ -71,7 +71,7 @@ def math_analysis_node(state: AgentState) -> Dict:
     if i_actual <= 0.0:
         return {"math_results": {"error": "Оборудование обесточено (ток нагрузки равен нулю)."}}
         
-    # ДОБАВЛЕНО: Защита от расчетов при токе < 30% (согласно РД 153-34.0-20.363-99)
+    # Защита от расчетов при токе < 30% (согласно РД 153-34.0-20.363-99)
     if i_actual < 0.3 * i_nom:
         return {"math_results": {"error": f"Ток нагрузки слишком мал ({round(i_actual/i_nom*100)}% от I_nom). По стандартам оценка K_def при токе < 30% не производится из-за огромной погрешности экстраполяции."}}
         
@@ -117,15 +117,51 @@ def ai_diagnosis_node(state: AgentState) -> Dict:
             "requires_human_approval": False
         }}
 
+    # =====================================================================
+    # ДЕТЕРМИНИРОВАННЫЙ АНАЛИЗ (ВЫЧИСЛЕНИЕ СТАТУСОВ НА PYTHON)
+    # =====================================================================
+    raw_k = state['math_results'].get('thermal_k_def', 0.0)
+    t_c = state['telemetry']['t_contact']
+    est_p = state['math_results'].get('estimated_pressure', 100.0)
+    ox_r = state['math_results'].get('oxidation_ratio', 1.0)
+
+    # 1. Строгий расчет степени критичности (ГОСТ Р 52726-2007 + РД)
+    if raw_k >= 2.0 or t_c >= 90.0:
+        severity = "Аварийное"
+        requires_human_approval = True
+    elif raw_k >= 1.5:
+        severity = "Предаварийное"
+        requires_human_approval = True
+    elif raw_k >= 1.2:
+        severity = "Требует ТО"
+        requires_human_approval = False
+    else:
+        severity = "Норма"
+        requires_human_approval = False
+
+    # 2. Строгое определение природы дефекта (Физика теории Хольма)
+    if raw_k < 1.2:
+        defect_type = "Отсутствует"
+    else:
+        if ox_r > 1.4 and est_p < 80.0:
+            defect_type = "Комплексный дефект"
+        elif ox_r > 1.4:
+            defect_type = "Химический (Окисление/Нагар)"
+        elif est_p < 80.0:
+            defect_type = "Механический износ (Усталость пружин)"
+        else:
+            defect_type = "Химический (Окисление/Нагар)"
+
     try:
         api_key = state["api_key"]
         proxy = state["proxy_settings"]["socks_proxy"]
         
         url = "https://api.groq.com/openai/v1/chat/completions"
         
-        system_prompt = """Ты промышленный ИИ-агент диагностической системы тепловизионного контроля (эксперт-диагност).
-Твоя задача — анализ состояния разъемного контакта шинного разъединителя 110 кВ на основе интеграции тепловых данных и механики Хольма.
-Ты должен вернуть результат СТРОГО в формате JSON. Поле chain_of_thought должно быть сплошным текстом (1 абзац)."""
+        system_prompt = f"""Ты промышленный ИИ-агент диагностической системы тепловизионного контроля (эксперт-диагност).
+Твоя задача — объяснить результаты детерминированного анализа разъемного контакта шинного разъединителя 110 кВ.
+Ты должен вернуть результат СТРОГО в формате JSON. Поле chain_of_thought должно быть сплошным текстом (1 абзац).
+Внимание: В итоговом ответе ты обязан использовать строго те статусы дефекта и критичности, которые определил математический контур."""
 
         user_prompt = f"""
         ТЕПЛОВИЗОР (Полевые данные):
@@ -133,15 +169,19 @@ def ai_diagnosis_node(state: AgentState) -> Dict:
         - Ток нагрузки: {state['telemetry']['i_actual']} А (Номинал: {state['telemetry']['i_nom']} А)
         - Скорость ветра: {state['telemetry']['wind_speed']} м/с
         
-        МАТЕМАТИЧЕСКИЙ СЛОЙ:
+        МАТЕМАТИЧЕСКИЙ АНАЛИЗ ОПРЕДЕЛИЛ СЛЕДУЮЩИЕ СТАТУСЫ (ПЕРЕНЕСИ ИХ В JSON БЕЗ ИЗМЕНЕНИЙ):
+        - defect_severity: "{severity}"
+        - defect_type: "{defect_type}"
+        - requires_human_approval: {str(requires_human_approval).lower()}
+        
+        ДОПОЛНИТЕЛЬНЫЕ ДАННЫЕ ДЛЯ ТЕКСТОВОГО ОПИСАНИЯ:
         - Расчетный остаточный ресурс пружины: {state['math_results']['estimated_pressure']}%
         - Фактический тепловой дефект (Raw K_def): {state['math_results']['thermal_k_def']}
         - Индекс окисления: {state['math_results']['oxidation_ratio']}
         
-        ИНСТРУКЦИЯ ПО АНАЛИЗУ:
-        1. defect_type: "Химический (Окисление/Нагар)" или "Механический износ (Усталость пружин)" или "Комплексный дефект" или "Отсутствует".
-        2. defect_severity: "Аварийное", "Предаварийное", "Требует ТО", "Норма".
-        3. chain_of_thought: Напиши краткий физический разбор ситуации сплошным текстом.
+        ИНСТРУКЦИЯ ПО НАПИСАНИЮ:
+        1. Напиши в 'chain_of_thought' лаконичный физико-технический анализ (1 абзац, 3-4 предложения) сплошным текстом, объясняющий, почему контакт находится в состоянии "{severity}" и почему дефект классифицирован как "{defect_type}".
+        2. Сформируй в 'recommendation' понятную инструкцию для ремонтной бригады.
         """
 
         payload = {
@@ -165,40 +205,30 @@ def ai_diagnosis_node(state: AgentState) -> Dict:
 
         ai_data = json.loads(response.json()['choices'][0]['message']['content'])
         
-        # Склейка, если ИИ вернул список
+        # Склейка, если ИИ всё же вернул список вместо строки
         if isinstance(ai_data.get("chain_of_thought"), list):
             parts = [str(item.get("description", item)) if isinstance(item, dict) else str(item) for item in ai_data["chain_of_thought"]]
             ai_data["chain_of_thought"] = " ".join(parts)
             
-        # =================================================================
-        # ДОБАВЛЕНО: Нейросимволический предохранитель (Hard Rule Override)
-        # =================================================================
-        # LLM может ошибаться, поэтому критические статусы мы форсируем кодом
-        raw_k = state['math_results'].get('thermal_k_def', 0)
-        t_c = state['telemetry']['t_contact']
-        
-        if raw_k >= 2.0 or t_c >= 90.0:
-            ai_data["defect_severity"] = "Аварийное"
-            ai_data["requires_human_approval"] = True
-        elif raw_k >= 1.5:
-            if ai_data["defect_severity"] not in ["Аварийное", "Предаварийное"]:
-                ai_data["defect_severity"] = "Предаварийное"
-            ai_data["requires_human_approval"] = True
-        elif raw_k >= 1.2:
-            if ai_data.get("defect_severity") in ["Норма"]:
-                ai_data["defect_severity"] = "Требует ТО"
+        # ЖЕСТКАЯ ГАРАНТИЯ ТОЧНОСТИ: Force-assign вычисленных на Python значений
+        ai_data["defect_severity"] = severity
+        ai_data["defect_type"] = defect_type
+        ai_data["requires_human_approval"] = requires_human_approval
+        ai_data["thermal_k_def"] = raw_k
+        ai_data["estimated_pressure"] = est_p
                 
         return {"ai_diagnosis": ai_data}
         
     except Exception as e:
+        # Резервный режим при сбое сети ИИ
         return {"ai_diagnosis": {
-             "chain_of_thought": f"Сбой связи при работе с ИИ: {e}.",
-             "thermal_k_def": state['math_results'].get('thermal_k_def', 0),
-             "estimated_pressure": state['math_results'].get('estimated_pressure', 0),
-             "defect_type": "Отсутствует",
-             "defect_severity": "Норма",
-             "recommendation": "Проведите ручную перепроверку данных.",
-             "requires_human_approval": True
+             "chain_of_thought": f"Сбой связи при работе с ИИ: {e}. Результаты рассчитаны локальной математической моделью.",
+             "thermal_k_def": raw_k,
+             "estimated_pressure": est_p,
+             "defect_type": defect_type,
+             "defect_severity": severity,
+             "recommendation": "Проведите осмотр контакта при следующем плановом обходе.",
+             "requires_human_approval": requires_human_approval
          }}
 
 def human_approval_node(state: AgentState) -> Dict:
@@ -250,14 +280,24 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("📋 Симуляционные пресеты")
-    preset = st.selectbox("Выберите пресет:", ["[Ручной ввод данных]", "Исправный контакт (Норма)", "Ослабление пружин (Механика)", "Выгорание контакта (Химия)"])
     
+    preset = st.selectbox("Выберите пресет:", [
+        "[Ручной ввод данных]", 
+        "Исправный контакт (Норма)", 
+        "Промежуточное состояние (Требует ТО)", 
+        "Ухудшение контакта (Предаварийное)",
+        "Аварийное состояние (Дефект)"
+    ])
+    
+    # Тонкая настройка пресетов под строгие термодинамические модели
     if preset == "Исправный контакт (Норма)":
-        t_contact_val, t_ambient_val, i_actual_val, i_nom_val, wind_val, cycles_val = 45.0, 25.0, 800.0, 800.0, 2.0, 50
-    elif preset == "Ослабление пружин (Механика)":
-        t_contact_val, t_ambient_val, i_actual_val, i_nom_val, wind_val, cycles_val = 68.0, 20.0, 800.0, 1000.0, 1.5, 1750
-    elif preset == "Выгорание контакта (Химия)":
-        t_contact_val, t_ambient_val, i_actual_val, i_nom_val, wind_val, cycles_val = 92.0, 20.0, 750.0, 1000.0, 2.0, 80
+        t_contact_val, t_ambient_val, i_actual_val, i_nom_val, wind_val, cycles_val = 25.0, 20.0, 600.0, 800.0, 1.0, 150
+    elif preset == "Промежуточное состояние (Требует ТО)":
+        t_contact_val, t_ambient_val, i_actual_val, i_nom_val, wind_val, cycles_val = 27.0, 20.0, 600.0, 800.0, 1.0, 800
+    elif preset == "Ухудшение контакта (Предаварийное)":
+        t_contact_val, t_ambient_val, i_actual_val, i_nom_val, wind_val, cycles_val = 29.0, 20.0, 600.0, 800.0, 1.0, 1000
+    elif preset == "Аварийное состояние (Дефект)":
+        t_contact_val, t_ambient_val, i_actual_val, i_nom_val, wind_val, cycles_val = 34.0, 21.0, 280.0, 800.0, 2.0, 1500
     else:
         t_contact_val, t_ambient_val, i_actual_val, i_nom_val, wind_val, cycles_val = 55.0, 22.0, 800.0, 1000.0, 2.0, 200
 

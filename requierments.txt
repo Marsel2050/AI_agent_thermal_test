@@ -1,8 +1,4 @@
 streamlit
-httpx
-
-$$socks$$
-
-
+httpx[socks]
 langgraph
 pydantic

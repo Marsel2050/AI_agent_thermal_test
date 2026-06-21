@@ -1,5 +1,6 @@
 streamlit
 httpx
 pysocks
+socksio
 langgraph
 pydantic

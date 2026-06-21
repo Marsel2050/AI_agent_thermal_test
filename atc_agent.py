@@ -19,17 +19,14 @@ st.set_page_config(
 )
 
 # =====================================================================
-# НАСТРОЙКИ СЕТИ И КЛЮЧЕЙ ПО УМОЛЧАНИЮ (ИСПРАВЛЕНО: Автоопределение среды)
+# НАСТРОЙКИ СЕТИ И КЛЮЧЕЙ ПО УМОЛЧАНИЮ
 # =====================================================================
-# Если приложение запущено в облаке Streamlit (/mount/src...), прокси по умолчанию пустой.
-# Если запущено локально на вашем ПК — подставляется локальный порт прокси.
 IS_CLOUD = os.path.exists("/mount/src")
 SOCKS5_PROXY = "" if IS_CLOUD else "socks5://127.0.0.1:10808"
 
 # Вставьте ваш ключ от Groq сюда, если хотите захардкодить его для удобства
 os.environ["GROQ_API_KEY"] = "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"
 
-# Настройки системных прокси-серверов по умолчанию (применяются только локально)
 if SOCKS5_PROXY:
     os.environ["http_proxy"] = SOCKS5_PROXY
     os.environ["https_proxy"] = SOCKS5_PROXY
@@ -74,6 +71,10 @@ def math_analysis_node(state: AgentState) -> Dict:
     if i_actual <= 0.0:
         return {"math_results": {"error": "Оборудование обесточено (ток нагрузки равен нулю)."}}
         
+    # ДОБАВЛЕНО: Защита от расчетов при токе < 30% (согласно РД 153-34.0-20.363-99)
+    if i_actual < 0.3 * i_nom:
+        return {"math_results": {"error": f"Ток нагрузки слишком мал ({round(i_actual/i_nom*100)}% от I_nom). По стандартам оценка K_def при токе < 30% не производится из-за огромной погрешности экстраполяции."}}
+        
     delta_t = max(t_contact - t_ambient, 0.1)
     
     # Моделирование механической усталости контактных пружин по циклам ВО (ГОСТ)
@@ -87,7 +88,7 @@ def math_analysis_node(state: AgentState) -> Dict:
     # Расчет фактического превышения сопротивления К_деф
     raw_k_def = (h_conv * delta_t * (i_nom**2)) / (h_0 * 15.0 * (i_actual**2))
     
-    # Ожидаемое сопротивление по теории Хольма для разъемных контактов (R ~ P^-0.5)
+    # Ожидаемое сопротивление по теории Хольма для разъемных контактов
     m_coeff = 0.5 
     expected_k_mech = 1.0 / (pressure_factor ** m_coeff)
     
@@ -104,14 +105,15 @@ def math_analysis_node(state: AgentState) -> Dict:
     }
 
 def ai_diagnosis_node(state: AgentState) -> Dict:
+    # Если математика выдала ошибку (например, ток < 30%), прерываем анализ
     if "error" in state.get("math_results", {}):
         return {"ai_diagnosis": {
-            "chain_of_thought": "Линия обесточена. Ток равен нулю. Анализ не требуется.",
+            "chain_of_thought": state["math_results"]["error"],
             "thermal_k_def": 0.0,
             "estimated_pressure": 100.0,
             "defect_type": "Отсутствует",
             "defect_severity": "Норма",
-            "recommendation": "Оборудование находится в резерве или отключено.",
+            "recommendation": "Повторить тепловизионный контроль при токе нагрузки не менее 30% от номинального.",
             "requires_human_approval": False
         }}
 
@@ -122,9 +124,8 @@ def ai_diagnosis_node(state: AgentState) -> Dict:
         url = "https://api.groq.com/openai/v1/chat/completions"
         
         system_prompt = """Ты промышленный ИИ-агент диагностической системы тепловизионного контроля (эксперт-диагност).
-Твоя задача — глубокий анализ состояния разъемного контакта шинного разъединителя 110 кВ на основе интеграции тепловых данных и механики Хольма (Data Fusion).
-Ты должен вернуть результат СТРОГО в формате JSON согласно схеме. 
-ВНИМАНИЕ: Поле chain_of_thought должно быть СТРОГО обычной текстовой строкой (сплошной текст), без массивов [] и вложенных объектов!"""
+Твоя задача — анализ состояния разъемного контакта шинного разъединителя 110 кВ на основе интеграции тепловых данных и механики Хольма.
+Ты должен вернуть результат СТРОГО в формате JSON. Поле chain_of_thought должно быть сплошным текстом (1 абзац)."""
 
         user_prompt = f"""
         ТЕПЛОВИЗОР (Полевые данные):
@@ -132,33 +133,15 @@ def ai_diagnosis_node(state: AgentState) -> Dict:
         - Ток нагрузки: {state['telemetry']['i_actual']} А (Номинал: {state['telemetry']['i_nom']} А)
         - Скорость ветра: {state['telemetry']['wind_speed']} м/с
         
-        SCADA / ЖУРНАЛ ТОиР (История оборудования):
-        - Коммутаций с последнего ремонта: {state['database_info']['switching_cycles']} циклов (ГОСТ ресурс: 2000)
-        
-        РЕЗУЛЬТАТЫ МАТЕМАТИЧЕСКОГО СЛОЯ АГЕНТА:
+        МАТЕМАТИЧЕСКИЙ СЛОЙ:
         - Расчетный остаточный ресурс пружины: {state['math_results']['estimated_pressure']}%
         - Фактический тепловой дефект (Raw K_def): {state['math_results']['thermal_k_def']}
-        - Ожидаемый дефект только из-за износа пружины (Mech K): {state['math_results']['mechanical_k_expected']}
-        - Индекс окисления (Oxidation ratio = Raw K / Mech K): {state['math_results']['oxidation_ratio']}
+        - Индекс окисления: {state['math_results']['oxidation_ratio']}
         
-        ЖЕСТКИЕ ПРАВИЛА КЛАССИФИКАЦИИ (ВЫПОЛНЯТЬ ОБЯЗАТЕЛЬНО):
-        1. defect_type (выбери строго одно значение):
-           - Если Индекс окисления > 1.5 и Ресурс пружины < 80% -> "Комплексный дефект"
-           - Если Индекс окисления > 1.5 -> "Химический (Окисление/Нагар)"
-           - Если Индекс окисления < 1.3 и Ресурс пружины < 80% -> "Механический износ (Усталость пружин)"
-           - Иначе -> "Отсутствует"
-        
-        2. defect_severity (выбери строго одно значение):
-           - Если Raw K_def > 2.0 ИЛИ Температура контакта > 90.0 -> "Аварийное"
-           - Если Raw K_def > 1.5 -> "Предаварийное"
-           - Если Raw K_def > 1.2 -> "Требует ТО"
-           - Иначе -> "Норма"
-        
-        3. requires_human_approval: 
-           - Строго true, если severity "Предаварийное" или "Аварийное", иначе false.
-           
-        4. chain_of_thought: 
-           - Напиши краткий физический разбор ситуации сплошным текстом (1 абзац, 3-4 предложения). НЕ ИСПОЛЬЗУЙ массивы, словари или пошаговые списки.
+        ИНСТРУКЦИЯ ПО АНАЛИЗУ:
+        1. defect_type: "Химический (Окисление/Нагар)" или "Механический износ (Усталость пружин)" или "Комплексный дефект" или "Отсутствует".
+        2. defect_severity: "Аварийное", "Предаварийное", "Требует ТО", "Норма".
+        3. chain_of_thought: Напиши краткий физический разбор ситуации сплошным текстом.
         """
 
         payload = {
@@ -172,8 +155,6 @@ def ai_diagnosis_node(state: AgentState) -> Dict:
         }
 
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        
-        # Исправление ошибки прокси
         proxy_url = proxy if proxy else None
 
         with httpx.Client(proxy=proxy_url, timeout=30.0) as client:
@@ -182,25 +163,36 @@ def ai_diagnosis_node(state: AgentState) -> Dict:
         if response.status_code != 200:
             raise Exception(f"Ошибка API Groq: {response.text}")
 
-        response_text = response.json()['choices'][0]['message']['content']
+        ai_data = json.loads(response.json()['choices'][0]['message']['content'])
         
-        # Защита от парсинга, если ИИ все равно вернул список в chain_of_thought
-        ai_data = json.loads(response_text)
+        # Склейка, если ИИ вернул список
         if isinstance(ai_data.get("chain_of_thought"), list):
-            # Собираем массив в единую строку
-            parts = []
-            for item in ai_data["chain_of_thought"]:
-                if isinstance(item, dict) and "description" in item:
-                    parts.append(item["description"])
-                else:
-                    parts.append(str(item))
+            parts = [str(item.get("description", item)) if isinstance(item, dict) else str(item) for item in ai_data["chain_of_thought"]]
             ai_data["chain_of_thought"] = " ".join(parts)
             
+        # =================================================================
+        # ДОБАВЛЕНО: Нейросимволический предохранитель (Hard Rule Override)
+        # =================================================================
+        # LLM может ошибаться, поэтому критические статусы мы форсируем кодом
+        raw_k = state['math_results'].get('thermal_k_def', 0)
+        t_c = state['telemetry']['t_contact']
+        
+        if raw_k >= 2.0 or t_c >= 90.0:
+            ai_data["defect_severity"] = "Аварийное"
+            ai_data["requires_human_approval"] = True
+        elif raw_k >= 1.5:
+            if ai_data["defect_severity"] not in ["Аварийное", "Предаварийное"]:
+                ai_data["defect_severity"] = "Предаварийное"
+            ai_data["requires_human_approval"] = True
+        elif raw_k >= 1.2:
+            if ai_data.get("defect_severity") in ["Норма"]:
+                ai_data["defect_severity"] = "Требует ТО"
+                
         return {"ai_diagnosis": ai_data}
         
     except Exception as e:
         return {"ai_diagnosis": {
-             "chain_of_thought": f"Сбой связи при работе с ИИ: {e}. Пожалуйста, проверьте прокси и ключ API.",
+             "chain_of_thought": f"Сбой связи при работе с ИИ: {e}.",
              "thermal_k_def": state['math_results'].get('thermal_k_def', 0),
              "estimated_pressure": state['math_results'].get('estimated_pressure', 0),
              "defect_type": "Отсутствует",
@@ -209,7 +201,6 @@ def ai_diagnosis_node(state: AgentState) -> Dict:
              "requires_human_approval": True
          }}
 
-# В веб-версии узел подтверждения просто обновляет лог в интерфейсе
 def human_approval_node(state: AgentState) -> Dict:
     return state
 
@@ -239,7 +230,6 @@ app = workflow.compile()
 # 4. ИНТЕРФЕЙС STREAMLIT
 # =====================================================================
 
-# Стилизация шапки приложения
 st.markdown("""
 <div style="background-color:#1E1E2F;padding:20px;border-radius:10px;margin-bottom:25px;border-left: 8px solid #FF4B4B;">
     <h2 style="color:white;margin:0;">⚡ Интеллектуальный ИИ-Агент Тепловизионного Диагностирования</h2>
@@ -247,60 +237,34 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Инициализация сессионного состояния для хранения результатов
 if "analysis_result" not in st.session_state:
     st.session_state.analysis_result = None
 if "approved" not in st.session_state:
     st.session_state.approved = False
 
-# --- СИДБАР (Настройки подключения и пресеты) ---
 with st.sidebar:
     st.header("⚙️ Конфигурация системы")
     
-    # 1. Ключи и Сеть
-    groq_key_input = st.text_input(
-        "Ключ Groq API (gsk_...):", 
-        value=os.environ.get("GROQ_API_KEY", ""), 
-        type="password"
-    )
-    socks_proxy_input = st.text_input(
-        "SOCKS5 Прокси (для обхода блокировок):", 
-        value=SOCKS5_PROXY
-    )
+    groq_key_input = st.text_input("Ключ Groq API (gsk_...):", value=os.environ.get("GROQ_API_KEY", ""), type="password")
+    socks_proxy_input = st.text_input("SOCKS5 Прокси:", value=SOCKS5_PROXY)
     
     st.markdown("---")
     st.subheader("📋 Симуляционные пресеты")
-    st.info("Выберите готовый сценарий для демонстрации работы системы:")
+    preset = st.selectbox("Выберите пресет:", ["[Ручной ввод данных]", "Исправный контакт (Норма)", "Ослабление пружин (Механика)", "Выгорание контакта (Химия)"])
     
-    preset = st.selectbox(
-        "Выберите пресет:",
-        ["[Ручной ввод данных]", "Исправный контакт (Норма)", "Ослабление пружин (Механика)", "Выгорание контакта (Химия)"]
-    )
-    
-    # Обработка пресетов (ошибка была в строке i_actual_val, i_nom_val)
     if preset == "Исправный контакт (Норма)":
-        t_contact_val, t_ambient_val = 45.0, 25.0
-        i_actual_val, i_nom_val = 800.0, 800.0
-        wind_val, cycles_val = 2.0, 50
+        t_contact_val, t_ambient_val, i_actual_val, i_nom_val, wind_val, cycles_val = 45.0, 25.0, 800.0, 800.0, 2.0, 50
     elif preset == "Ослабление пружин (Механика)":
-        t_contact_val, t_ambient_val = 68.0, 20.0
-        i_actual_val, i_nom_val = 800.0, 1000.0
-        wind_val, cycles_val = 1.5, 1750  # Пружина изношена на 85%+
+        t_contact_val, t_ambient_val, i_actual_val, i_nom_val, wind_val, cycles_val = 68.0, 20.0, 800.0, 1000.0, 1.5, 1750
     elif preset == "Выгорание контакта (Химия)":
-        t_contact_val, t_ambient_val = 92.0, 20.0
-        i_actual_val, i_nom_val = 750.0, 1000.0
-        wind_val, cycles_val = 2.0, 80    # Пружина новая, но греется сильно
+        t_contact_val, t_ambient_val, i_actual_val, i_nom_val, wind_val, cycles_val = 92.0, 20.0, 750.0, 1000.0, 2.0, 80
     else:
-        t_contact_val, t_ambient_val = 55.0, 22.0
-        i_actual_val, i_nom_val = 800.0, 1000.0
-        wind_val, cycles_val = 2.0, 200
+        t_contact_val, t_ambient_val, i_actual_val, i_nom_val, wind_val, cycles_val = 55.0, 22.0, 800.0, 1000.0, 2.0, 200
 
-# --- ГЛАВНАЯ СТРАНИЦА: ВВОД ДАННЫХ ---
 col_inputs, col_visual = st.columns([2, 3])
 
 with col_inputs:
     st.subheader("📥 Входные параметры датчиков")
-    
     with st.form("diagnose_form"):
         st.markdown("**Телеметрические данные тепловизора:**")
         t_contact = st.slider("Температура контакта (°C)", 10.0, 150.0, t_contact_val, step=0.5)
@@ -315,48 +279,30 @@ with col_inputs:
             i_nom = st.number_input("Номинальный ток (А)", min_value=100.0, max_value=2500.0, value=i_nom_val, step=10.0)
             
         st.markdown("**Данные системы ТОиР (Архив SCADA):**")
-        switching_cycles = st.number_input("Количество переключений (ВО) с ремонта:", min_value=0, max_value=3000, value=cycles_val, step=10)
+        switching_cycles = st.number_input("Количество переключений (ВО):", min_value=0, max_value=3000, value=cycles_val, step=10)
         
         submit_btn = st.form_submit_button("⚡ ЗАПУСТИТЬ МУЛЬТИАГЕНТНЫЙ АНАЛИЗ")
 
-# Обработка нажатия кнопки формы
 if submit_btn:
-    # Приоритет отдаем ключу из поля ввода, если он пустой - берем захардкоженный ключ из переменной окружения
     active_key = groq_key_input if groq_key_input else os.environ.get("GROQ_API_KEY", "")
     
     if not active_key or "gsk_" not in active_key:
-        st.error("❌ Пожалуйста, введите корректный API-ключ от Groq (начинающийся на gsk_) в левом боковом меню или пропишите его в самом коде.")
+        st.error("❌ Пожалуйста, введите корректный API-ключ от Groq.")
     else:
-        # Формируем состояние графа
         state = {
-            "telemetry": {
-                "t_contact": t_contact,
-                "t_ambient": t_ambient,
-                "i_actual": i_actual,
-                "i_nom": i_nom,
-                "wind_speed": wind_speed
-            },
-            "database_info": {
-                "switching_cycles": switching_cycles
-            },
-            "math_results": {},
-            "ai_diagnosis": {},
-            "proxy_settings": {
-                "socks_proxy": socks_proxy_input
-            },
-            "api_key": active_key
+            "telemetry": {"t_contact": t_contact, "t_ambient": t_ambient, "i_actual": i_actual, "i_nom": i_nom, "wind_speed": wind_speed},
+            "database_info": {"switching_cycles": switching_cycles},
+            "math_results": {}, "ai_diagnosis": {},
+            "proxy_settings": {"socks_proxy": socks_proxy_input}, "api_key": active_key
         }
         
-        with st.spinner("🧠 Агент выполняет термодинамические расчеты и анализирует модель упругой деформации..."):
+        with st.spinner("🧠 Агент выполняет термодинамические расчеты..."):
             try:
-                # Запуск компилированного графа LangGraph
-                output = app.invoke(state)
-                st.session_state.analysis_result = output
-                st.session_state.approved = False # Сбрасываем флаг подтверждения при новом расчете
+                st.session_state.analysis_result = app.invoke(state)
+                st.session_state.approved = False
             except Exception as e:
                 st.error(f"Ошибка при выполнении графа: {e}")
 
-# --- ВЫВОД РЕЗУЛЬТАТОВ ДИАГНОСТИКИ ---
 with col_visual:
     st.subheader("📊 Аналитическая визуализация")
     
@@ -365,62 +311,34 @@ with col_visual:
         math_res = res["math_results"]
         ai_res = res["ai_diagnosis"]
         
-        # Если математический блок вернул ошибку
         if "error" in math_res:
             st.warning(f"⚠️ {math_res['error']}")
         else:
-            # Сетка индикаторов (Metrics)
             m_col1, m_col2, m_col3 = st.columns(3)
             with m_col1:
-                st.metric(
-                    label="Коэффициент дефектности (K_def)", 
-                    value=math_res['thermal_k_def'], 
-                    delta="Превышение!" if math_res['thermal_k_def'] > 1.5 else "В норме",
-                    delta_color="inverse"
-                )
+                st.metric("Коэффициент дефектности (K_def)", math_res['thermal_k_def'], "Превышение!" if math_res['thermal_k_def'] > 1.5 else "В норме", delta_color="inverse")
             with m_col2:
-                # Давление пружины
-                pressure = math_res['estimated_pressure']
-                st.metric(
-                    label="Давление пружин губок", 
-                    value=f"{pressure}%", 
-                    delta=f"{round(pressure - 100, 1)}% усадка",
-                    delta_color="normal" if pressure > 70 else "inverse"
-                )
+                st.metric("Давление пружин губок", f"{math_res['estimated_pressure']}%", f"{round(math_res['estimated_pressure'] - 100, 1)}% усадка", delta_color="normal" if math_res['estimated_pressure'] > 70 else "inverse")
             with m_col3:
-                # Индекс окисления контактов
-                ox_ratio = math_res['oxidation_ratio']
-                st.metric(
-                    label="Индекс окисления (Химия)", 
-                    value=ox_ratio,
-                    delta="Окислено" if ox_ratio > 1.4 else "Чистый металл",
-                    delta_color="inverse"
-                )
+                st.metric("Индекс окисления (Химия)", math_res['oxidation_ratio'], "Окислено" if math_res['oxidation_ratio'] > 1.4 else "Чистый металл", delta_color="inverse")
             
-            # Визуальный статус критичности
             severity = ai_res.get("defect_severity", "Норма")
             if severity == "Аварийное":
-                st.error("🔴 СТАТУС: АВАРИЙНОЕ СОСТОЯНИЕ! Требуется немедленное отключение и вывод в ремонт.")
+                st.error("🔴 СТАТУС: АВАРИЙНОЕ СОСТОЯНИЕ! Требуется немедленное отключение.")
             elif severity == "Предаварийное":
-                st.warning("🟡 СТАТУС: ПРЕДАВАРИЙНОЕ СОСТОЯНИЕ! Рекомендуется внеочередное техническое обслуживание.")
+                st.warning("🟡 СТАТУС: ПРЕДАВАРИЙНОЕ СОСТОЯНИЕ! Рекомендуется ТО.")
             elif severity == "Требует ТО":
-                st.info("🔵 СТАТУС: ТРЕБУЕТ ПЛАНОВОГО ТО. Износ компенсируется теплоотдачей.")
+                st.info("🔵 СТАТУС: ТРЕБУЕТ ПЛАНОВОГО ТО.")
             else:
                 st.success("🟢 СТАТУС: ОБОРУДОВАНИЕ ИСПРАВНО (НОРМА).")
                 
-            # График износа пружины (Интерактивная шкала)
             st.markdown(f"**График усадки пружины разъединителя (Текущая точка: {switching_cycles} ВО)**")
-            # Генерируем данные для кривой усталости
             cycles_range = list(range(0, 2200, 100))
             pressures = [round(max(30.0, (1.0 - 0.6 * (c / 2000.0)) * 100), 1) for c in cycles_range]
-            
-            chart_data = {"Ресурс (циклы)": cycles_range, "Давление пружины (%)": pressures}
-            st.line_chart(chart_data, x="Ресурс (циклы)", y="Давление пружины (%)")
-            
+            st.line_chart({"Ресурс (циклы)": cycles_range, "Давление пружины (%)": pressures}, x="Ресурс (циклы)", y="Давление пружины (%)")
     else:
-        st.info("👈 Настройте параметры в боковой панели и нажмите кнопку запуска для отображения результатов.")
+        st.info("👈 Настройте параметры в боковой панели и запустите анализ.")
 
-# --- ПОДРОБНЫЙ ОТЧЕТ ИИ-АГЕНТА ---
 if st.session_state.analysis_result is not None:
     res = st.session_state.analysis_result
     ai_res = res["ai_diagnosis"]
@@ -432,17 +350,13 @@ if st.session_state.analysis_result is not None:
     
     with col_report:
         st.markdown(f"### ⚙️ Природа дефекта: `{ai_res.get('defect_type', 'Отсутствует')}`")
-        
         st.markdown("#### 📝 Физико-техническое обоснование:")
         st.write(ai_res.get("chain_of_thought", "Анализ не проведен."))
-        
         st.markdown("#### 🛠️ Техническая рекомендация бригаде:")
         st.info(ai_res.get("recommendation", "Рекомендации отсутствуют."))
         
     with col_action:
         st.markdown("### 🛡️ Инженерный контур безопасности")
-        
-        # Если ИИ выставил флаг экстренного вмешательства
         if ai_res.get("requires_human_approval", False):
             st.markdown("""
             <div style="background-color:#ffebeb;padding:15px;border-radius:5px;border-left: 5px solid #ff4d4d;color:#800000;margin-bottom:15px;">
@@ -450,14 +364,12 @@ if st.session_state.analysis_result is not None:
                 Автоматический анализ LangGraph выявил угрозу выгорания контакта разъединителя.
             </div>
             """, unsafe_allow_html=True)
-            
-            # Интерактивная кнопка подтверждения
             if not st.session_state.approved:
                 if st.button("🚨 ПОДТВЕРДИТЬ И ЗАПРОСИТЬ ВЫВОД В РЕМОНТ"):
                     st.session_state.approved = True
                     st.balloons()
                     st.rerun()
             else:
-                st.success("✅ СИГНАЛ ПРИНЯТ: Информация о дефекте успешно отправлена диспетчеру сети 110 кВ! Сформирована заявка на внеочередной ремонт.")
+                st.success("✅ СИГНАЛ ПРИНЯТ: Информация о дефекте отправлена диспетчеру сети 110 кВ!")
         else:
             st.success("🔒 Автоматический режим: Риски перегрева отсутствуют. Контур безопасности закрыт в штатном режиме.")

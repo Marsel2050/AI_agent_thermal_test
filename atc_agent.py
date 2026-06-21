@@ -19,17 +19,21 @@ st.set_page_config(
 )
 
 # =====================================================================
-# НАСТРОЙКИ СЕТИ И КЛЮЧЕЙ ПО УМОЛЧАНИЮ
+# НАСТРОЙКИ СЕТИ И КЛЮЧЕЙ ПО УМОЛЧАНИЮ (ИСПРАВЛЕНО: Автоопределение среды)
 # =====================================================================
-SOCKS5_PROXY = "socks5://127.0.0.1:10808"
+# Если приложение запущено в облаке Streamlit (/mount/src...), прокси по умолчанию пустой.
+# Если запущено локально на вашем ПК — подставляется локальный порт прокси.
+IS_CLOUD = os.path.exists("/mount/src")
+SOCKS5_PROXY = "" if IS_CLOUD else "socks5://127.0.0.1:10808"
 
 # Вставьте ваш ключ от Groq сюда, если хотите захардкодить его для удобства
 os.environ["GROQ_API_KEY"] = "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"
 
-# Настройки системных прокси-серверов по умолчанию
-os.environ["http_proxy"] = SOCKS5_PROXY
-os.environ["https_proxy"] = SOCKS5_PROXY
-os.environ["all_proxy"] = SOCKS5_PROXY
+# Настройки системных прокси-серверов по умолчанию (применяются только локально)
+if SOCKS5_PROXY:
+    os.environ["http_proxy"] = SOCKS5_PROXY
+    os.environ["https_proxy"] = SOCKS5_PROXY
+    os.environ["all_proxy"] = SOCKS5_PROXY
 
 # =====================================================================
 # 1. СХЕМА ДАННЫХ И ВАЛИДАЦИЯ (Pydantic & State)

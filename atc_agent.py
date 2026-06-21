@@ -23,8 +23,8 @@ st.set_page_config(
 # =====================================================================
 SOCKS5_PROXY = "socks5://127.0.0.1:10808"
 
-# Вставьте ваш ключ от Groq сюда, если хотите захардкодить его
-os.environ["GROQ_API_KEY"] = ""
+# Вставьте ваш ключ от Groq сюда, если хотите захардкодить его для удобства
+os.environ["GROQ_API_KEY"] = "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"
 
 # Настройки системных прокси-серверов по умолчанию
 os.environ["http_proxy"] = SOCKS5_PROXY
@@ -155,7 +155,7 @@ def ai_diagnosis_node(state: AgentState) -> Dict:
 
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         
-        # ИСПРАВЛЕНИЕ ОШИБКИ: Используем современный параметр proxy (строка) вместо устаревшего proxies (словарь)
+        # Исправление ошибки прокси
         proxy_url = proxy if proxy else None
 
         with httpx.Client(proxy=proxy_url, timeout=30.0) as client:
@@ -290,8 +290,11 @@ with col_inputs:
 
 # Обработка нажатия кнопки формы
 if submit_btn:
-    if not groq_key_input or "gsk_" not in groq_key_input:
-        st.error("❌ Пожалуйста, введите корректный API-ключ от Groq (начинающийся на gsk_) в левом боковом меню.")
+    # Приоритет отдаем ключу из поля ввода, если он пустой - берем захардкоженный ключ из переменной окружения
+    active_key = groq_key_input if groq_key_input else os.environ.get("GROQ_API_KEY", "")
+    
+    if not active_key or "gsk_" not in active_key:
+        st.error("❌ Пожалуйста, введите корректный API-ключ от Groq (начинающийся на gsk_) в левом боковом меню или пропишите его в самом коде.")
     else:
         # Формируем состояние графа
         state = {
@@ -310,7 +313,7 @@ if submit_btn:
             "proxy_settings": {
                 "socks_proxy": socks_proxy_input
             },
-            "api_key": groq_key_input
+            "api_key": active_key
         }
         
         with st.spinner("🧠 Агент выполняет термодинамические расчеты и анализирует модель упругой деформации..."):

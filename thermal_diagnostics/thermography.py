@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import io
+import math
 import shutil
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,6 +60,50 @@ class ThermogramData:
     @property
     def height(self) -> int:
         return int(self.matrix_celsius.shape[0])
+
+
+def region_from_drag(
+    selection: Mapping[str, float | int], image_width: int, image_height: int
+) -> Region:
+    """Convert a drag event from the displayed preview to matrix coordinates."""
+
+    required = {"x1", "y1", "x2", "y2", "width", "height"}
+    missing = required.difference(selection)
+    if missing:
+        raise ValueError(f"В событии выбора области отсутствуют поля: {', '.join(sorted(missing))}")
+
+    displayed_width = float(selection["width"])
+    displayed_height = float(selection["height"])
+    if displayed_width <= 0 or displayed_height <= 0:
+        raise ValueError("Размер отображаемой термограммы должен быть положительным")
+    if image_width <= 0 or image_height <= 0:
+        raise ValueError("Размер температурной матрицы должен быть положительным")
+
+    x_values = sorted((float(selection["x1"]), float(selection["x2"])))
+    y_values = sorted((float(selection["y1"]), float(selection["y2"])))
+    left = min(max(x_values[0], 0.0), displayed_width)
+    right = min(max(x_values[1], 0.0), displayed_width)
+    top = min(max(y_values[0], 0.0), displayed_height)
+    bottom = min(max(y_values[1], 0.0), displayed_height)
+
+    x = math.floor(left * image_width / displayed_width)
+    y = math.floor(top * image_height / displayed_height)
+    x_end = math.ceil(right * image_width / displayed_width)
+    y_end = math.ceil(bottom * image_height / displayed_height)
+    return Region(x, y, max(1, x_end - x), max(1, y_end - y)).bounded(
+        image_width, image_height
+    )
+
+
+def regions_overlap(first: Region, second: Region) -> bool:
+    """Return True when two rectangular regions share at least one pixel area."""
+
+    return (
+        first.x < second.x + second.width
+        and second.x < first.x + first.width
+        and first.y < second.y + second.height
+        and second.y < first.y + first.height
+    )
 
 
 def region_statistics(matrix: np.ndarray, region: Region) -> RegionStatistics:

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
 import numpy as np
 import streamlit as st
 from pydantic import ValidationError
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 from thermal_diagnostics.models import AssessmentStatus, DiagnosticInputs
 from thermal_diagnostics.physics import evaluate_contact
@@ -17,7 +19,9 @@ from thermal_diagnostics.thermography import (
     ThermogramError,
     read_preview,
     read_radiometric_flir,
+    region_from_drag,
     region_statistics,
+    regions_overlap,
     thermal_preview,
 )
 
@@ -39,30 +43,6 @@ def _secret(name: str) -> str | None:
     except Exception:
         value = None
     return str(value) if value else None
-
-
-def _region_controls(prefix: str, width: int, height: int, default: Region) -> Region:
-    default = default.bounded(width, height)
-    st.caption(prefix)
-    columns = st.columns(4)
-    values = []
-    labels = ("X", "Y", "ширина", "высота")
-    defaults = (default.x, default.y, default.width, default.height)
-    maxima = (width - 1, height - 1, width, height)
-    for column, label, value, maximum in zip(columns, labels, defaults, maxima):
-        with column:
-            values.append(
-                int(
-                    st.number_input(
-                        label,
-                        min_value=0 if label in {"X", "Y"} else 1,
-                        max_value=maximum,
-                        value=value,
-                        key=f"{prefix}_{label}",
-                    )
-                )
-            )
-    return Region(*values).bounded(width, height)
 
 
 st.title("⚡ Тепловизионная диагностика разъёмных контактов")
@@ -111,39 +91,135 @@ if uploaded is not None:
         except ThermogramError as preview_error:
             st.error(str(preview_error))
 
+thermogram_zones_confirmed = thermogram is None
 if thermogram is not None:
     matrix = thermogram.matrix_celsius
+    file_id = hashlib.sha256(file_bytes).hexdigest()[:12]
+    state_id_key = "roi_thermogram_id"
+    if st.session_state.get(state_id_key) != file_id:
+        st.session_state[state_id_key] = file_id
+        st.session_state.pop("contact_region", None)
+        st.session_state.pop("reference_region", None)
+
     hottest_y, hottest_x = np.unravel_index(np.nanargmax(matrix), matrix.shape)
     roi_width = max(2, thermogram.width // 10)
     roi_height = max(2, thermogram.height // 10)
-    contact_region = _region_controls(
-        "Контакт (95-й перцент)",
-        thermogram.width,
-        thermogram.height,
-        Region(hottest_x - roi_width // 2, hottest_y - roi_height // 2, roi_width, roi_height),
+    confirm_key = f"roi_confirmed_{file_id}"
+
+    st.subheader("Выбор областей измерения")
+    st.info(
+        "Выберите тип области и обведите её мышью на термограмме. "
+        "Самая горячая точка не считается автоматически распознанным контактом."
     )
-    reference_region = _region_controls(
-        "Эталонный участок (медиана)",
-        thermogram.width,
-        thermogram.height,
-        Region(0, 0, roi_width, roi_height),
+    selection_target = st.radio(
+        "Сейчас выделяется",
+        ("Контакт", "Исправный эталон"),
+        horizontal=True,
+        key=f"roi_target_{file_id}",
     )
-    contact_stats = region_statistics(matrix, contact_region)
-    reference_stats = region_statistics(matrix, reference_region)
-    contact_default = round(contact_stats.percentile_95, 2)
-    reference_default = round(reference_stats.median, 2)
-    st.image(
-        thermal_preview(matrix, contact_region, reference_region),
-        caption="Зелёная область — контакт, голубая — исправный эталон",
+    target_state_key = (
+        "contact_region" if selection_target == "Контакт" else "reference_region"
     )
-    metric_columns = st.columns(4)
-    metric_columns[0].metric("T min", f"{np.nanmin(matrix):.1f} °C")
-    metric_columns[1].metric("T max", f"{np.nanmax(matrix):.1f} °C")
-    metric_columns[2].metric("T контакта", f"{contact_default:.1f} °C")
-    metric_columns[3].metric("T эталона", f"{reference_default:.1f} °C")
+
+    action_columns = st.columns(2)
+    if action_columns[0].button(
+        "Подсказать самую горячую область",
+        disabled=selection_target != "Контакт",
+        help="Это только начальная подсказка, а не распознавание контактного соединения.",
+        key=f"suggest_hot_{file_id}",
+    ):
+        st.session_state["contact_region"] = Region(
+            hottest_x - roi_width // 2,
+            hottest_y - roi_height // 2,
+            roi_width,
+            roi_height,
+        ).bounded(thermogram.width, thermogram.height)
+        st.session_state[confirm_key] = False
+        st.rerun()
+    if action_columns[1].button(
+        "Сбросить выбранную область", key=f"reset_roi_{file_id}_{selection_target}"
+    ):
+        st.session_state.pop(target_state_key, None)
+        st.session_state[confirm_key] = False
+        st.rerun()
+
+    contact_region = st.session_state.get("contact_region")
+    reference_region = st.session_state.get("reference_region")
+    selector_image = thermal_preview(matrix, contact_region, reference_region)
+    selection = streamlit_image_coordinates(
+        selector_image,
+        width=thermogram.width,
+        key=f"roi_selector_{file_id}_{selection_target}",
+        click_and_drag=True,
+        cursor="crosshair",
+    )
+    st.caption(
+        "Зажмите левую кнопку мыши, обведите прямоугольник и отпустите. "
+        "Зелёная область — контакт, голубая — исправный эталон."
+    )
+    if selection is not None:
+        event_key = f"roi_event_{file_id}_{selection_target}"
+        event_id = selection.get("unix_time")
+        if event_id != st.session_state.get(event_key):
+            selected_region = region_from_drag(
+                selection, thermogram.width, thermogram.height
+            )
+            if selected_region.width < 3 or selected_region.height < 3:
+                st.warning(
+                    "Область слишком мала. Выделите прямоугольник не менее 3×3 пикселей."
+                )
+            else:
+                st.session_state[event_key] = event_id
+                st.session_state[target_state_key] = selected_region
+                st.session_state[confirm_key] = False
+                st.rerun()
+
+    contact_region = st.session_state.get("contact_region")
+    reference_region = st.session_state.get("reference_region")
+    region_columns = st.columns(2)
+    region_columns[0].write(
+        f"**Контакт:** `{contact_region}`" if contact_region else "**Контакт:** не выбран"
+    )
+    region_columns[1].write(
+        f"**Эталон:** `{reference_region}`" if reference_region else "**Эталон:** не выбран"
+    )
+
+    zones_ready = contact_region is not None and reference_region is not None
+    zones_overlap = bool(
+        zones_ready and regions_overlap(contact_region, reference_region)
+    )
+    if zones_overlap:
+        st.error("Области контакта и эталона пересекаются. Выберите их заново.")
+        st.session_state[confirm_key] = False
+    elif not zones_ready:
+        st.warning("Для расчёта необходимо выделить обе области.")
+
+    if zones_ready and not zones_overlap:
+        thermogram_zones_confirmed = st.checkbox(
+            "Подтверждаю, что зелёная область относится к исследуемому контакту, "
+            "а голубая — к сопоставимому исправному эталону",
+            key=confirm_key,
+        )
+        contact_stats = region_statistics(matrix, contact_region)
+        reference_stats = region_statistics(matrix, reference_region)
+        contact_value = round(contact_stats.percentile_95, 2)
+        reference_value = round(reference_stats.median, 2)
+        metric_columns = st.columns(4)
+        metric_columns[0].metric("T min", f"{np.nanmin(matrix):.1f} °C")
+        metric_columns[1].metric("T max", f"{np.nanmax(matrix):.1f} °C")
+        metric_columns[2].metric("T контакта", f"{contact_value:.1f} °C")
+        metric_columns[3].metric("T эталона", f"{reference_value:.1f} °C")
+        if thermogram_zones_confirmed:
+            contact_default = contact_value
+            reference_default = reference_value
 
 st.header("2. Условия измерения")
-with st.form("diagnostics"):
+diagnostics_form_key = (
+    "diagnostics_manual"
+    if thermogram is None
+    else f"diagnostics_{file_id}_{int(thermogram_zones_confirmed)}"
+)
+with st.form(diagnostics_form_key):
     left, middle, right = st.columns(3)
     with left:
         t_contact = st.number_input("Температура контакта, °C", value=contact_default)
@@ -159,6 +235,10 @@ with st.form("diagnostics"):
         use_limit = st.checkbox("Учитывать паспортный предел перегрева")
         max_rise = st.number_input("Предел перегрева, °C", min_value=1.0, value=65.0, disabled=not use_limit)
     submitted = st.form_submit_button("Рассчитать", type="primary")
+
+if thermogram is not None and not thermogram_zones_confirmed:
+    st.warning("Расчёт заблокирован до выбора и подтверждения обеих областей.")
+    submitted = False
 
 if submitted:
     try:
@@ -234,3 +314,4 @@ if "report" in st.session_state:
         file_name="thermal_diagnostic_report.json",
         mime="application/json",
     )
+

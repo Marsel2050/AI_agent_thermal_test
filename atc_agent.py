@@ -9,6 +9,14 @@ import streamlit as st
 from pydantic import ValidationError
 from streamlit_image_coordinates import streamlit_image_coordinates
 
+from thermal_diagnostics.comsol_surrogate import (
+    CALIBRATION_CURRENT_MAX_A,
+    CALIBRATION_CURRENT_MIN_A,
+    FIT_MAX_ABS_ERROR_C,
+    FIT_R2,
+    compare_with_comsol,
+    predict_max_temperature,
+)
 from thermal_diagnostics.models import AssessmentStatus, DiagnosticInputs
 from thermal_diagnostics.physics import evaluate_contact
 from thermal_diagnostics.reporting import enhance_report
@@ -234,6 +242,20 @@ with st.form(diagnostics_form_key):
         switching_cycles = st.number_input("Количество переключений (справочно)", min_value=0, value=0)
         use_limit = st.checkbox("Учитывать паспортный предел перегрева")
         max_rise = st.number_input("Предел перегрева, °C", min_value=1.0, value=65.0, disabled=not use_limit)
+        use_comsol_model = st.checkbox(
+            "Сопоставить с моделью COMSOL",
+            value=True,
+            help="Модель откалибрована для текущей геометрии шин на 25 расчётах COMSOL.",
+        )
+        contact_resistance_uohm = st.number_input(
+            "Контактное сопротивление для модели, мкОм",
+            min_value=0.0,
+            max_value=1000.0,
+            value=20.0,
+            step=5.0,
+            disabled=not use_comsol_model,
+            help="Измеренное или сценарное Rc. Калибровочный диапазон: 5…100 мкОм.",
+        )
     submitted = st.form_submit_button("Рассчитать", type="primary")
 
 if thermogram is not None and not thermogram_zones_confirmed:
@@ -257,9 +279,23 @@ if submitted:
         llm_warning = None
         if use_llm and active_key:
             report, llm_warning = enhance_report(report, inputs, api_key=active_key)
+        comsol_comparison = None
+        comsol_warning = None
+        if use_comsol_model and i_actual > 0:
+            comsol_comparison = compare_with_comsol(
+                measured_temperature_c=t_contact,
+                current_a=i_actual,
+                assumed_resistance_uohm=contact_resistance_uohm,
+                ambient_c=t_ambient,
+                temperature_uncertainty_c=temperature_uncertainty,
+            )
+        elif use_comsol_model:
+            comsol_warning = "Для сопоставления с COMSOL фактический ток должен быть больше нуля."
         st.session_state["report"] = report
         st.session_state["inputs"] = inputs
         st.session_state["llm_warning"] = llm_warning
+        st.session_state["comsol_comparison"] = comsol_comparison
+        st.session_state["comsol_warning"] = comsol_warning
         st.session_state["approved"] = False
     except ValidationError as exc:
         st.error(str(exc))
@@ -289,6 +325,68 @@ if "report" in st.session_state:
         "Перегрев при I_nom",
         "—" if report.normalized_contact_rise is None else f"{report.normalized_contact_rise:.1f} °C",
     )
+
+    if st.session_state.get("comsol_warning"):
+        st.info(st.session_state["comsol_warning"])
+
+    comsol_comparison = st.session_state.get("comsol_comparison")
+    if comsol_comparison is not None:
+        st.subheader("Сопоставление с физической моделью COMSOL")
+        with st.container(border=True):
+            with st.container(horizontal=True):
+                st.metric(
+                    "Прогноз COMSOL",
+                    f"{comsol_comparison.predicted_temperature_c:.1f} °C",
+                    border=True,
+                )
+                st.metric(
+                    "Измерение − модель",
+                    f"{comsol_comparison.temperature_residual_c:+.1f} °C",
+                    border=True,
+                )
+                st.metric(
+                    "Rc по термограмме",
+                    f"{comsol_comparison.estimated_resistance_uohm:.1f} мкОм",
+                    border=True,
+                )
+
+            if comsol_comparison.within_calibration_domain:
+                st.success("Рабочая точка находится внутри калибровочного диапазона модели.")
+            else:
+                st.info("Часть параметров находится вне калибровочного диапазона; показана экстраполяция.")
+
+            curve_currents = np.linspace(
+                CALIBRATION_CURRENT_MIN_A,
+                CALIBRATION_CURRENT_MAX_A,
+                17,
+            )
+            curve_temperatures = [
+                predict_max_temperature(
+                    current,
+                    comsol_comparison.assumed_resistance_uohm,
+                    st.session_state["inputs"].t_ambient,
+                )
+                for current in curve_currents
+            ]
+            st.line_chart(
+                {
+                    "Ток, A": curve_currents,
+                    "Расчётная температура, °C": curve_temperatures,
+                },
+                x="Ток, A",
+                y="Расчётная температура, °C",
+                x_label="Ток, A",
+                y_label="Максимальная температура, °C",
+                height=280,
+            )
+            st.caption(
+                "Суррогат построен по 25 стационарным расчётам COMSOL 6.4: "
+                f"R²={FIT_R2:.9f}, максимальная ошибка аппроксимации {FIT_MAX_ABS_ERROR_C:.3f} °C. "
+                "Модель служит инженерным ориентиром и не заменяет измерение переходного сопротивления."
+            )
+            for warning in comsol_comparison.warnings:
+                st.warning(warning)
+
     st.subheader("Техническое обоснование")
     st.write(report.technical_rationale)
     st.subheader("Рекомендация")
@@ -308,6 +406,8 @@ if "report" in st.session_state:
         "inputs": st.session_state["inputs"].model_dump(mode="json"),
         "result": report.model_dump(mode="json"),
     }
+    if comsol_comparison is not None:
+        export["comsol_model"] = comsol_comparison.to_dict()
     st.download_button(
         "Скачать JSON-отчёт",
         data=json.dumps(export, ensure_ascii=False, indent=2),

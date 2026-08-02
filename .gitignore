@@ -8,5 +8,6 @@ __pycache__/
 .streamlit/secrets.toml
 *.npy
 *.csv
+!thermal_diagnostics/data/comsol_contact_sweep.csv
 *.seq
 *.fff

@@ -2,7 +2,13 @@ import unittest
 
 import numpy as np
 
-from thermal_diagnostics.thermography import Region, region_statistics, thermal_preview
+from thermal_diagnostics.thermography import (
+    Region,
+    region_from_drag,
+    region_statistics,
+    regions_overlap,
+    thermal_preview,
+)
 
 
 class ThermographyTests(unittest.TestCase):
@@ -24,6 +30,41 @@ class ThermographyTests(unittest.TestCase):
         )
         self.assertEqual(image.mode, "RGB")
         self.assertEqual(image.size, (5, 4))
+
+    def test_drag_coordinates_are_scaled_to_temperature_matrix(self):
+        region = region_from_drag(
+            {
+                "x1": 10,
+                "y1": 20,
+                "x2": 110,
+                "y2": 120,
+                "width": 320,
+                "height": 256,
+            },
+            image_width=640,
+            image_height=512,
+        )
+        self.assertEqual(region, Region(20, 40, 200, 200))
+
+    def test_reverse_drag_is_bounded_to_image(self):
+        region = region_from_drag(
+            {
+                "x1": 90,
+                "y1": 80,
+                "x2": -10,
+                "y2": -20,
+                "width": 100,
+                "height": 100,
+            },
+            image_width=200,
+            image_height=200,
+        )
+        self.assertEqual(region, Region(0, 0, 180, 160))
+
+    def test_regions_overlap_but_touching_edges_do_not(self):
+        first = Region(10, 10, 20, 20)
+        self.assertTrue(regions_overlap(first, Region(25, 25, 10, 10)))
+        self.assertFalse(regions_overlap(first, Region(30, 10, 10, 10)))
 
 
 if __name__ == "__main__":

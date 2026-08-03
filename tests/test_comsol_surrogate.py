@@ -5,6 +5,7 @@ from pathlib import Path
 from thermal_diagnostics.comsol_surrogate import (
     FIT_MAX_ABS_ERROR_C,
     compare_with_comsol,
+    describe_temperature_residual,
     estimate_contact_resistance,
     predict_max_temperature,
 )
@@ -61,6 +62,17 @@ class ComsolSurrogateTests(unittest.TestCase):
         )
         self.assertEqual(comparison.estimated_resistance_uohm, 0.0)
         self.assertTrue(any("ограничена нулём" in item for item in comparison.warnings))
+
+    def test_residual_description_explains_direction(self):
+        self.assertEqual(
+            describe_temperature_residual(-58.2),
+            "Прогноз COMSOL выше измеренной температуры на 58.2 °C.",
+        )
+        self.assertEqual(
+            describe_temperature_residual(4.6),
+            "Измеренная температура выше прогноза COMSOL на 4.6 °C.",
+        )
+        self.assertIn("совпадает", describe_temperature_residual(0.01))
 
 
 if __name__ == "__main__":

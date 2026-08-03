@@ -99,6 +99,18 @@ def estimate_contact_resistance(
     )
 
 
+def describe_temperature_residual(residual_c: float) -> str:
+    """Explain the signed measurement-minus-model residual in plain language."""
+
+    residual = _require_finite("Разность температур", residual_c)
+    magnitude = abs(residual)
+    if magnitude < 0.05:
+        return "Измеренная температура практически совпадает с прогнозом COMSOL."
+    if residual > 0:
+        return f"Измеренная температура выше прогноза COMSOL на {magnitude:.1f} °C."
+    return f"Прогноз COMSOL выше измеренной температуры на {magnitude:.1f} °C."
+
+
 def compare_with_comsol(
     *,
     measured_temperature_c: float,

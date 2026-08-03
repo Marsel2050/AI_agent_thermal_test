@@ -12,9 +12,12 @@ from streamlit_image_coordinates import streamlit_image_coordinates
 from thermal_diagnostics.comsol_surrogate import (
     CALIBRATION_CURRENT_MAX_A,
     CALIBRATION_CURRENT_MIN_A,
+    CALIBRATION_RESISTANCE_MAX_UOHM,
+    CALIBRATION_RESISTANCE_MIN_UOHM,
     FIT_MAX_ABS_ERROR_C,
     FIT_R2,
     compare_with_comsol,
+    describe_temperature_residual,
     predict_max_temperature,
 )
 from thermal_diagnostics.models import AssessmentStatus, DiagnosticInputs
@@ -51,6 +54,21 @@ def _secret(name: str) -> str | None:
     except Exception:
         value = None
     return str(value) if value else None
+
+
+def _load_comsol_control_example(widget_prefix: str) -> None:
+    """Populate a known point from the COMSOL calibration table."""
+
+    control_values = {
+        "t_contact": 53.41,
+        "t_reference": 30.0,
+        "t_ambient": 20.0,
+        "i_actual": 400.0,
+        "i_nominal": 500.0,
+        "contact_resistance": 20.0,
+    }
+    for name, value in control_values.items():
+        st.session_state[f"{widget_prefix}_{name}"] = value
 
 
 st.title("⚡ Тепловизионная диагностика разъёмных контактов")
@@ -227,15 +245,59 @@ diagnostics_form_key = (
     if thermogram is None
     else f"diagnostics_{file_id}_{int(thermogram_zones_confirmed)}"
 )
+widget_prefix = f"{diagnostics_form_key}_input"
+input_defaults = {
+    f"{widget_prefix}_t_contact": float(contact_default),
+    f"{widget_prefix}_t_reference": float(reference_default),
+    f"{widget_prefix}_t_ambient": 20.0,
+    f"{widget_prefix}_i_actual": 400.0,
+    f"{widget_prefix}_i_nominal": 500.0,
+    f"{widget_prefix}_contact_resistance": 20.0,
+}
+for state_key, default_value in input_defaults.items():
+    st.session_state.setdefault(state_key, default_value)
+
+st.caption(
+    "Рабочий диапазон суррогата COMSOL: "
+    f"{CALIBRATION_CURRENT_MIN_A:.0f}…{CALIBRATION_CURRENT_MAX_A:.0f} A и "
+    f"{CALIBRATION_RESISTANCE_MIN_UOHM:.0f}…{CALIBRATION_RESISTANCE_MAX_UOHM:.0f} мкОм."
+)
+st.button(
+    "Подставить контрольный пример COMSOL",
+    key=f"{diagnostics_form_key}_load_control_example",
+    help="Загрузит проверочную точку: 400 A, 20 мкОм, 20 °C и ожидаемые 53,41 °C.",
+    on_click=_load_comsol_control_example,
+    args=(widget_prefix,),
+    icon=":material/science:",
+)
+
 with st.form(diagnostics_form_key):
     left, middle, right = st.columns(3)
     with left:
-        t_contact = st.number_input("Температура контакта, °C", value=contact_default)
-        t_reference = st.number_input("Температура исправного эталона, °C", value=reference_default)
-        t_ambient = st.number_input("Температура воздуха, °C", value=20.0)
+        t_contact = st.number_input(
+            "Температура контакта, °C",
+            key=f"{widget_prefix}_t_contact",
+        )
+        t_reference = st.number_input(
+            "Температура исправного эталона, °C",
+            key=f"{widget_prefix}_t_reference",
+        )
+        t_ambient = st.number_input(
+            "Температура воздуха, °C",
+            key=f"{widget_prefix}_t_ambient",
+        )
     with middle:
-        i_actual = st.number_input("Фактический ток, A", min_value=0.0, value=600.0)
-        i_nominal = st.number_input("Номинальный ток, A", min_value=1.0, value=800.0)
+        i_actual = st.number_input(
+            "Фактический ток, A",
+            min_value=0.0,
+            key=f"{widget_prefix}_i_actual",
+            help=f"Для COMSOL используйте диапазон {CALIBRATION_CURRENT_MIN_A:.0f}…{CALIBRATION_CURRENT_MAX_A:.0f} A.",
+        )
+        i_nominal = st.number_input(
+            "Номинальный ток, A",
+            min_value=1.0,
+            key=f"{widget_prefix}_i_nominal",
+        )
         current_exponent = st.number_input("Показатель пересчёта по току", min_value=1.0, max_value=2.5, value=2.0)
     with right:
         temperature_uncertainty = st.number_input("Погрешность температуры, °C", min_value=0.1, value=2.0)
@@ -251,10 +313,16 @@ with st.form(diagnostics_form_key):
             "Контактное сопротивление для модели, мкОм",
             min_value=0.0,
             max_value=1000.0,
-            value=20.0,
             step=5.0,
+            key=f"{widget_prefix}_contact_resistance",
             disabled=not use_comsol_model,
             help="Измеренное или сценарное Rc. Калибровочный диапазон: 5…100 мкОм.",
+        )
+        allow_comsol_extrapolation = st.checkbox(
+            "Разрешить экстраполяцию COMSOL",
+            value=False,
+            disabled=not use_comsol_model,
+            help="Включайте только для исследовательского расчёта: точность вне диапазона калибровки не подтверждена.",
         )
     submitted = st.form_submit_button("Рассчитать", type="primary")
 
@@ -282,13 +350,21 @@ if submitted:
         comsol_comparison = None
         comsol_warning = None
         if use_comsol_model and i_actual > 0:
-            comsol_comparison = compare_with_comsol(
+            candidate_comparison = compare_with_comsol(
                 measured_temperature_c=t_contact,
                 current_a=i_actual,
                 assumed_resistance_uohm=contact_resistance_uohm,
                 ambient_c=t_ambient,
                 temperature_uncertainty_c=temperature_uncertainty,
             )
+            if candidate_comparison.within_calibration_domain or allow_comsol_extrapolation:
+                comsol_comparison = candidate_comparison
+            else:
+                comsol_warning = (
+                    "Сопоставление COMSOL не показано: параметры выходят за подтверждённый "
+                    "диапазон модели. Исправьте значения или явно включите «Разрешить "
+                    "экстраполяцию COMSOL» и повторите расчёт."
+                )
         elif use_comsol_model:
             comsol_warning = "Для сопоставления с COMSOL фактический ток должен быть больше нуля."
         st.session_state["report"] = report
@@ -340,15 +416,29 @@ if "report" in st.session_state:
                     border=True,
                 )
                 st.metric(
-                    "Измерение − модель",
-                    f"{comsol_comparison.temperature_residual_c:+.1f} °C",
+                    "Расхождение температур",
+                    f"{abs(comsol_comparison.temperature_residual_c):.1f} °C",
+                    help=describe_temperature_residual(
+                        comsol_comparison.temperature_residual_c
+                    ),
                     border=True,
                 )
                 st.metric(
                     "Rc по термограмме",
                     f"{comsol_comparison.estimated_resistance_uohm:.1f} мкОм",
+                    help=(
+                        "Оценка по измеренной температуре для откалиброванной геометрии. "
+                        "Если расчёт даёт отрицательное сопротивление, физически невозможное "
+                        "значение ограничивается нулём."
+                    ),
                     border=True,
                 )
+
+            st.caption(
+                describe_temperature_residual(
+                    comsol_comparison.temperature_residual_c
+                )
+            )
 
             if comsol_comparison.within_calibration_domain:
                 st.success("Рабочая точка находится внутри калибровочного диапазона модели.")
